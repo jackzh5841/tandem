@@ -11,9 +11,9 @@ only**, so a history that has diverged is reported for you to resolve rather tha
 force-overwritten, and a machine that is asleep or off the network is treated as
 "away," never as an error.
 
-It is a small, dependency-free Bash script. macOS-first (uses `launchd` for the
-background timer); the sync/mirror commands themselves are plain POSIX-ish shell
-and Git.
+It is a small, dependency-free Bash script that runs on macOS and Linux. The
+background timer uses `launchd` on macOS and a `systemd --user` timer on Linux;
+the sync/mirror commands themselves are plain POSIX-ish shell and Git.
 
 ## Why this exists
 
@@ -93,10 +93,14 @@ machine, so day to day it is just `git commit` then `tandem sync`.
 Keep the bares flowing between machines automatically:
 
 ```sh
-tandem install    # launchd timer: `tandem mirror` every 5 minutes
+tandem install    # background timer: `tandem mirror` every 5 minutes
+                  # (launchd on macOS, systemd --user timer on Linux)
 tandem mirror     # or run it by hand
 tandem status --bares   # what each local mirror currently holds
 ```
+
+On Linux, view the timer's output with `journalctl --user -u tandem-mirror`, and
+run `loginctl enable-linger "$USER"` if you want it to run while you're logged out.
 
 ### Letting a peer pull from this machine
 
@@ -137,10 +141,11 @@ auto-adopt check). Per-remote `git config remote.<name>.sshCommand` is honored.
 
 ## Limitations
 
-- The background timer is macOS/`launchd` only. `sync`/`mirror`/`serve` work on
-  any Unix with Bash and Git — **feel free to branch and port the timer to other
-  platforms** (a Linux/systemd version is the obvious next step; the OS-specific
-  code is isolated to `install`/`uninstall`). See [CONTRIBUTING.md](CONTRIBUTING.md).
+- The background timer supports macOS (`launchd`) and Linux (`systemd --user`);
+  on anything else, schedule `tandem mirror` from cron. `sync`/`mirror`/`serve`
+  work on any Unix with Bash and Git. Ports to other schedulers are welcome —
+  the OS-specific code is isolated to `install`/`uninstall`; see
+  [CONTRIBUTING.md](CONTRIBUTING.md).
 - Assumes the same `bare_dir` path on every machine (override with
   `remote_bare_dir`).
 - New *repositories* are discovered from peers automatically; brand-new

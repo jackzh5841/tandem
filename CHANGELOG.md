@@ -4,6 +4,21 @@ All notable changes to tandem are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-08-18
+
+### Added
+
+- Linux support for the background timer: `tandem install` / `tandem uninstall`
+  now write a `systemd --user` timer on Linux and the `launchd` agent on macOS,
+  selected by platform. On other systems they explain how to schedule
+  `tandem mirror` from cron.
+
+### Fixed
+
+- `mirror` peer discovery: the `find` fallback used to list a peer's bares was
+  missing its `-exec ... \;` terminator, so it failed on peers reached through a
+  plain shell (the primary `tandem list` path was unaffected).
+
 ## [0.1.0] — 2026-08-18
 
 Initial release.
@@ -27,4 +42,5 @@ Initial release.
   `tandem mirror` (macOS).
 - Config-driven for any number of machines via `~/.config/tandem/config`.
 
+[0.2.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.1.0

@@ -9,7 +9,7 @@
 #   tandem status      what this repo (or --all, or --bares) knows, offline
 #   tandem list        print this machine's bare repo names (used by mirror)
 #   tandem serve       SSH forced command: permit only replication (for authorized_keys)
-#   tandem install     install a launchd timer that runs `tandem mirror`
+#   tandem install     install a background timer (launchd/systemd) for `tandem mirror`
 #   tandem uninstall   remove that timer
 #   tandem init        write a starter config file
 #
@@ -27,7 +27,7 @@
 # anything, 4 no remote could be reached.
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 CONFIG="${TANDEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tandem/config}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tandem"
@@ -311,7 +311,7 @@ discover() {  # names of a peer's bares: tandem list, else find, else our own se
     local host="$1" names
     names="$(ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" 'tandem list' 2>/dev/null)"
     [ -n "$names" ] || names="$(ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" \
-        "find '$REMOTE_BARE_DIR' -maxdepth 1 -type d -name '*.git' -exec basename {} ;" 2>/dev/null)"
+        "find '$REMOTE_BARE_DIR' -maxdepth 1 -type d -name '*.git' -exec basename {} \;" 2>/dev/null)"
     [ -n "$names" ] || names="$(cmd_list)"
     printf '%s\n' "$names"
 }
@@ -443,12 +443,33 @@ status_here() {
 }
 
 # ---------------------------------------------------------------- install
-plist_path() { printf '%s/Library/LaunchAgents/local.tandem.mirror.plist' "$HOME"; }
+# The periodic `tandem mirror` job is the only platform-specific piece: launchd
+# on macOS, a systemd --user timer on Linux, cron elsewhere.
+plist_path()  { printf '%s/Library/LaunchAgents/local.tandem.mirror.plist' "$HOME"; }
+systemd_dir() { printf '%s/systemd/user' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 
 cmd_install() {
     load_config
-    command -v launchctl >/dev/null 2>&1 || die 2 'tandem install currently supports macOS (launchd) only.'
-    local self plist interval="${1:-300}" log
+    local interval="${1:-300}"
+    case "$(uname -s)" in
+        Darwin) install_launchd "$interval" ;;
+        Linux)  install_systemd "$interval" ;;
+        *) die 2 "No automatic timer for $(uname -s)." \
+               "Schedule \`$(resolve_self) mirror\` every ${interval}s with cron or your scheduler." ;;
+    esac
+}
+
+cmd_uninstall() {
+    case "$(uname -s)" in
+        Darwin) uninstall_launchd ;;
+        Linux)  uninstall_systemd ;;
+        *) die 2 "No timer to remove on $(uname -s)." ;;
+    esac
+}
+
+install_launchd() {
+    command -v launchctl >/dev/null 2>&1 || die 2 'launchctl not found.'
+    local self plist interval="$1" log
     self="$(resolve_self)"; plist="$(plist_path)"; log="$STATE_DIR/mirror.log"
     mkdir -p "$STATE_DIR" "$HOME/Library/LaunchAgents"
     cat > "$plist" <<PLIST
@@ -469,15 +490,56 @@ cmd_install() {
 PLIST
     launchctl unload "$plist" 2>/dev/null || true
     launchctl load "$plist"
-    printf 'Installed local.tandem.mirror: every %ss, `tandem mirror`. Log: %s\n' "$interval" "$log"
+    printf 'Installed local.tandem.mirror (launchd): every %ss, `tandem mirror`. Log: %s\n' "$interval" "$log"
 }
 
-cmd_uninstall() {
-    command -v launchctl >/dev/null 2>&1 || die 2 'Nothing to uninstall (launchd not present).'
+uninstall_launchd() {
+    command -v launchctl >/dev/null 2>&1 || die 2 'launchctl not found.'
     local plist; plist="$(plist_path)"
     [ -f "$plist" ] || die 2 'No tandem mirror timer is installed.'
     launchctl unload "$plist" 2>/dev/null || true; rm -f "$plist"
-    printf 'Removed local.tandem.mirror.\n'
+    printf 'Removed local.tandem.mirror (launchd).\n'
+}
+
+install_systemd() {
+    command -v systemctl >/dev/null 2>&1 ||
+        die 2 'systemctl not found.' "Schedule \`$(resolve_self) mirror\` with cron instead."
+    local self dir interval="$1"
+    self="$(resolve_self)"; dir="$(systemd_dir)"
+    mkdir -p "$dir"
+    cat > "$dir/tandem-mirror.service" <<UNIT
+[Unit]
+Description=tandem mirror — replicate bare Git repos from peers
+
+[Service]
+Type=oneshot
+ExecStart=$self mirror
+UNIT
+    cat > "$dir/tandem-mirror.timer" <<UNIT
+[Unit]
+Description=Run tandem mirror periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${interval}s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now tandem-mirror.timer
+    printf 'Installed tandem-mirror.timer (systemd --user): every %ss, `tandem mirror`.\n' "$interval"
+    printf 'Logs: journalctl --user -u tandem-mirror. To run while logged out: loginctl enable-linger %s\n' "${USER:-$(id -un)}"
+}
+
+uninstall_systemd() {
+    command -v systemctl >/dev/null 2>&1 || die 2 'systemctl not found.'
+    local dir; dir="$(systemd_dir)"
+    systemctl --user disable --now tandem-mirror.timer 2>/dev/null || true
+    rm -f "$dir/tandem-mirror.timer" "$dir/tandem-mirror.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    printf 'Removed tandem-mirror.timer (systemd --user).\n'
 }
 
 # ---------------------------------------------------------------- init
