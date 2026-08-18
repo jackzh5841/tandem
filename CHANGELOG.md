@@ -27,4 +27,4 @@ Initial release.
   `tandem mirror` (macOS).
 - Config-driven for any number of machines via `~/.config/tandem/config`.
 
-[0.1.0]: https://example.com/tandem/releases/tag/v0.1.0
+[0.1.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.1.0

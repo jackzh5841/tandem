@@ -61,7 +61,7 @@ directory is the required, local remote.
 ## Install
 
 ```sh
-git clone <this repo> ~/src/tandem
+git clone https://github.com/jackzh5841/tandem ~/src/tandem
 ln -s ~/src/tandem/tandem ~/.local/bin/tandem   # anywhere on your PATH
 tandem init                                     # writes ~/.config/tandem/config
 $EDITOR ~/.config/tandem/config
