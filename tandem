@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+# tandem — keep your own Git repositories in step across your own machines,
+# with no third-party host. Each machine holds bare repositories under one
+# directory; tandem replicates them peer-to-peer and syncs your working trees.
+#
+#   tandem sync        sync the current working repo with every machine's remote
+#   tandem mirror      pull every peer's bare repos into this machine's, ff-only
+#   tandem adopt       (re)point this repo's remotes at the machine it sits on
+#   tandem status      what this repo (or --all, or --bares) knows, offline
+#   tandem list        print this machine's bare repo names (used by mirror)
+#   tandem serve       SSH forced command: permit only replication (for authorized_keys)
+#   tandem install     install a launchd timer that runs `tandem mirror`
+#   tandem uninstall   remove that timer
+#   tandem init        write a starter config file
+#
+# Design: never lose unsynced work and never auto-resolve a conflict. Every
+# fetch is fast-forward only; a repo whose history has diverged from a peer is
+# reported and left untouched for review, never force-updated or pruned. A
+# remote on the local filesystem is required (it must succeed); a remote reached
+# over the network is best effort (a peer that is asleep or away is fine). That
+# is what keeps a laptop useful off the network: it commits into its own bare
+# repo and can restore from it fully offline.
+#
+# Configuration lives at ${TANDEM_CONFIG:-~/.config/tandem/config}. See `tandem init`.
+#
+# Exit status: 0 ok, 2 misconfigured / cannot run here, 3 refused to change
+# anything, 4 no remote could be reached.
+set -uo pipefail
+
+VERSION="0.1.0"
+
+CONFIG="${TANDEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tandem/config}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tandem"
+SYNC_LOG="$STATE_DIR/sync.tsv"
+
+# ---------------------------------------------------------------- small helpers
+die() { local s="$1"; shift; printf '%s\n' "$@" >&2; exit "$s"; }
+
+trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
+
+expand_tilde() {
+    case "$1" in
+        '~')    printf '%s' "$HOME" ;;
+        '~/'*)  printf '%s/%s' "$HOME" "${1#\~/}" ;;
+        *)      printf '%s' "$1" ;;
+    esac
+}
+
+mtime() { [ -e "$1" ] || return 0; stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true; }
+
+ago() {
+    local t="$1" d; [ -n "$t" ] || { printf 'never'; return; }
+    d=$(( $(date +%s) - t ))
+    if   [ "$d" -lt 60 ];    then printf 'just now'
+    elif [ "$d" -lt 3600 ];  then printf '%dm ago' $((d / 60))
+    elif [ "$d" -lt 86400 ]; then printf '%dh ago' $((d / 3600))
+    else printf '%dd ago' $((d / 86400)); fi
+}
+
+stamp() {
+    local t="$1"; [ -n "$t" ] || { printf 'never'; return; }
+    printf '%s (%s)' "$(ago "$t")" \
+        "$(date -r "$t" '+%F %H:%M' 2>/dev/null || date -d "@$t" '+%F %H:%M')"
+}
+
+# Absolute path to this script even through a symlink, for launchd/authorized_keys.
+resolve_self() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -h "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    printf '%s/%s\n' "$(cd -P "$(dirname "$src")" && pwd)" "$(basename "$src")"
+}
+
+# ---------------------------------------------------------------- config
+MACHINE=""; BARE_DIR=""; PROJECTS_DIR=""; REMOTE_BARE_DIR=""; TIMEOUT=5
+PEER_NAMES=(); PEER_HOSTS=()
+
+load_config() {
+    [ -f "$CONFIG" ] ||
+        die 2 "No config at $CONFIG." 'Run `tandem init` to create one.'
+    local line key val rest name
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"; line="$(trim "$line")"
+        [ -n "$line" ] || continue
+        case "$line" in
+            peer[[:space:]]*)
+                rest="$(trim "${line#peer}")"
+                name="$(trim "${rest%%=*}")"; val="$(trim "${rest#*=}")"
+                [ -n "$name" ] && [ -n "$val" ] && { PEER_NAMES+=("$name"); PEER_HOSTS+=("$val"); }
+                ;;
+            *=*)
+                key="$(trim "${line%%=*}")"; val="$(trim "${line#*=}")"
+                case "$key" in
+                    machine)         MACHINE="$val" ;;
+                    bare_dir)        BARE_DIR="$(expand_tilde "$val")" ;;
+                    projects_dir)    PROJECTS_DIR="$(expand_tilde "$val")" ;;
+                    remote_bare_dir) REMOTE_BARE_DIR="$val" ;;
+                    timeout)         TIMEOUT="$val" ;;
+                esac
+                ;;
+        esac
+    done < "$CONFIG"
+    [ -n "$MACHINE" ] || die 2 "config: 'machine' is required in $CONFIG"
+    [ -n "$BARE_DIR" ] || BARE_DIR="$HOME/GitRemotes"
+    [ -n "$PROJECTS_DIR" ] || PROJECTS_DIR="$HOME/Projects"
+    [ -n "$REMOTE_BARE_DIR" ] || REMOTE_BARE_DIR="$BARE_DIR"
+}
+
+# Every machine name, this one first.
+machine_names() {
+    printf '%s\n' "$MACHINE"
+    local n
+    for n in ${PEER_NAMES[@]+"${PEER_NAMES[@]}"}; do printf '%s\n' "$n"; done
+}
+
+host_for() {  # host_for <machine>  -> ssh host, or nothing for the local machine
+    local m="$1" i
+    [ "$m" = "$MACHINE" ] && return 0
+    for i in ${PEER_NAMES[@]+"${!PEER_NAMES[@]}"}; do
+        [ "${PEER_NAMES[$i]}" = "$m" ] && { printf '%s' "${PEER_HOSTS[$i]}"; return 0; }
+    done
+}
+
+url_for() {  # url_for <machine> <barename>
+    local m="$1" name="$2"
+    if [ "$m" = "$MACHINE" ]; then printf '%s/%s' "$BARE_DIR" "$name"
+    else printf '%s:%s/%s' "$(host_for "$m")" "$REMOTE_BARE_DIR" "$name"; fi
+}
+
+# ---------------------------------------------------------------- git helpers
+require_repo() {
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+        die 2 'tandem must be run inside a Git working repository.'
+}
+has_remote() { git remote get-url "$1" >/dev/null 2>&1; }
+
+remote_is_local() {  # a remote is local unless its URL names another host
+    local url; url="$(git remote get-url "$1" 2>/dev/null)" || return 1
+    case "$url" in
+        file://*) return 0 ;;
+        *://*)    return 1 ;;
+        *:*)      case "${url%%:*}" in */*) return 0 ;; *) return 1 ;; esac ;;
+        *)        return 0 ;;
+    esac
+}
+role_of() { remote_is_local "$1" && printf 'local, required' || printf 'network, best effort'; }
+
+ssh_command_for() {  # bounded ssh for a network remote; preserves any per-remote sshCommand
+    local base; base="$(git config --get "remote.$1.sshCommand" || printf 'ssh')"
+    printf '%s -o BatchMode=yes -o ConnectTimeout=%s' "$base" "$TIMEOUT"
+}
+git_on() {  # run a git command against a remote with the right bounds for its kind
+    local rem="$1"; shift
+    if remote_is_local "$rem"; then git "$@"
+    else GIT_SSH_COMMAND="$(ssh_command_for "$rem")" git "$@"; fi
+}
+
+# Machine remotes present in this repo, local ones first.
+configured_remotes() {
+    local m
+    while IFS= read -r m; do has_remote "$m" && remote_is_local "$m" && printf '%s\n' "$m"; done < <(machine_names)
+    while IFS= read -r m; do has_remote "$m" && ! remote_is_local "$m" && printf '%s\n' "$m"; done < <(machine_names)
+}
+
+last_sync_epoch() {  # <repo_root> <remote>
+    [ -f "$SYNC_LOG" ] || return 0
+    awk -F'\t' -v r="$1" -v m="$2" '$2==r && $3==m {t=$1} END{if(t)print t}' "$SYNC_LOG"
+}
+record_sync() {  # <repo_root> <remote> <branch> <commit>
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$SYNC_LOG" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- adopt
+set_remote() {  # <name> <url>  — only ever touches the named remote
+    local name="$1" url="$2" cur
+    if cur="$(git remote get-url "$name" 2>/dev/null)"; then
+        if [ "$cur" = "$url" ]; then printf '  %-10s unchanged  %s\n' "$name" "$url"
+        else git remote set-url "$name" "$url"; printf '  %-10s %s  ->  %s\n' "$name" "$cur" "$url"; fi
+    else git remote add "$name" "$url"; printf '  %-10s added      %s\n' "$name" "$url"; fi
+}
+
+looks_like_ours() {
+    local m root
+    while IFS= read -r m; do has_remote "$m" && return 0; done < <(machine_names)
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+    case "$root/" in "$PROJECTS_DIR"/*) return 0 ;; esac
+    return 1
+}
+adopt_needed() { has_remote "$MACHINE" && remote_is_local "$MACHINE" && return 1; return 0; }
+
+barename_here() {  # authoritative from an existing machine remote, else from path
+    local root m url name=""
+    while IFS= read -r m; do
+        url="$(git remote get-url "$m" 2>/dev/null)" || continue
+        name="$(basename "$url")"; [ -n "$name" ] && break
+    done < <(machine_names)
+    if [ -z "$name" ]; then
+        root="$(git rev-parse --show-toplevel)"
+        case "$root/" in
+            "$PROJECTS_DIR"/*) name="$(printf '%s' "${root#"$PROJECTS_DIR"/}" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')" ;;
+            *) name="$(basename "$root")" ;;
+        esac
+    fi
+    case "$name" in *.git) ;; *) name="$name.git" ;; esac
+    printf '%s' "$name"
+}
+
+adopt_core() {
+    local root name bare m
+    root="$(git rev-parse --show-toplevel)"
+    name="$(barename_here)"
+    bare="$BARE_DIR/$name"
+
+    printf 'Adopting %s onto %s (bare %s).\n\n' "${root/#$HOME/~}" "$MACHINE" "$name"
+    if [ ! -d "$bare" ]; then
+        mkdir -p "$BARE_DIR"
+        git init --bare --initial-branch=main "$bare" >/dev/null
+        printf '  created local bare  %s\n' "$bare"
+    fi
+    while IFS= read -r m; do set_remote "$m" "$(url_for "$m" "$name")"; done < <(machine_names)
+    printf '\n%s is %s.\n' "$MACHINE" "$(role_of "$MACHINE")"
+}
+
+cmd_adopt() { require_repo; load_config; adopt_core; printf 'Run `tandem sync` to publish and reconcile.\n'; }
+
+# ---------------------------------------------------------------- sync
+# Fast-forward onto <ref> when strictly ahead. 0 up to date/fast-forwarded,
+# 1 diverged, 2 would need a clean tree. Caller decides if that is fatal.
+advance_onto() {  # <ref> <label> <branch>
+    local ref="$1" label="$2" branch="$3" here there
+    here=$(git rev-parse HEAD); there=$(git rev-parse "$ref")
+    git merge-base --is-ancestor "$there" "$here" && return 0
+    git merge-base --is-ancestor "$here" "$there" || return 1
+    [ -z "$(git status --porcelain --untracked-files=all)" ] || return 2
+    printf 'Fast-forwarding %s from %s...\n' "$branch" "$label"
+    git merge --ff-only "$ref"
+}
+
+cmd_sync() {
+    require_repo; load_config
+
+    if [ -z "${TANDEM_NO_ADOPT:-}" ] && looks_like_ours && adopt_needed; then
+        printf 'Remotes do not match this machine — adopting first.\n\n'
+        adopt_core; printf '\n'
+    fi
+
+    local branch root rem synced=0
+    local -a remotes=() live=() pushable=()
+    branch=$(git symbolic-ref --quiet --short HEAD) ||
+        die 2 'tandem sync requires a checked-out branch, not a detached HEAD.'
+    root="$(git rev-parse --show-toplevel)"
+
+    while IFS= read -r rem; do [ -n "$rem" ] && remotes+=("$rem"); done < <(configured_remotes)
+    [ "${#remotes[@]}" -gt 0 ] ||
+        die 2 "This repo has none of these machine remotes: $(machine_names | tr '\n' ' ')" \
+              'Run `tandem adopt` to set them up.'
+
+    for rem in "${remotes[@]}"; do
+        printf 'Last synchronized with %-10s %s\n' "$rem:" "$(stamp "$(last_sync_epoch "$root" "$rem")")"
+    done
+
+    for rem in "${remotes[@]}"; do
+        printf 'Fetching %s...\n' "$rem"
+        if git_on "$rem" fetch --prune "$rem"; then live+=("$rem")
+        elif remote_is_local "$rem"; then die 3 '' "The local repo for $rem could not be read." 'Nothing was changed.'
+        else printf '%s could not be reached — carrying on without it.\n' "$rem" >&2; fi
+    done
+
+    local rc
+    for rem in ${live[@]+"${live[@]}"}; do
+        if ! git show-ref --verify --quiet "refs/remotes/$rem/$branch"; then pushable+=("$rem"); continue; fi
+        rc=0; advance_onto "refs/remotes/$rem/$branch" "$rem" "$branch" || rc=$?
+        case "$rc" in
+            0) pushable+=("$rem") ;;
+            1) if remote_is_local "$rem"; then die 3 '' "Local and $rem $branch have diverged. Nothing was pushed." 'Resolve the histories explicitly first.'; fi
+               printf 'Local and %s %s have diverged — skipping it.\n' "$rem" "$branch" >&2 ;;
+            2) if remote_is_local "$rem"; then die 3 '' "$rem $branch is ahead but this working tree is dirty." 'Commit, stash, or resolve the local work first.'; fi
+               printf '%s is ahead but this working tree is dirty — skipping it.\n' "$rem" >&2 ;;
+        esac
+    done
+
+    for rem in ${pushable[@]+"${pushable[@]}"}; do
+        printf 'Pushing %s to %s...\n' "$branch" "$rem"
+        if git_on "$rem" push --follow-tags "$rem" "HEAD:refs/heads/$branch"; then
+            record_sync "$root" "$rem" "$branch" "$(git rev-parse HEAD)"; synced=$((synced + 1))
+        elif remote_is_local "$rem"; then die 3 '' "Pushing to $rem failed." 'Nothing further was attempted.'
+        else printf 'Pushing to %s failed — it is not synchronized.\n' "$rem" >&2; fi
+    done
+
+    # Track the local machine's branch when it exists.
+    if remote_is_local "$MACHINE" && git show-ref --verify --quiet "refs/remotes/$MACHINE/$branch"; then
+        git branch --set-upstream-to="$MACHINE/$branch" "$branch" >/dev/null 2>&1 || true
+    fi
+
+    [ "$synced" -gt 0 ] || die 4 '' 'No remote could be reached. Nothing was synchronized.' \
+        'Your commits are safe locally; run `tandem sync` again when a remote is available.'
+    if [ "$synced" -lt "${#remotes[@]}" ]; then printf 'Synchronized with %d of %d remotes.\n' "$synced" "${#remotes[@]}"
+    else printf 'Synchronized successfully.\n'; fi
+}
+
+# ---------------------------------------------------------------- mirror
+cmd_list() {
+    [ -d "$BARE_DIR" ] || return 0
+    local d; for d in "$BARE_DIR"/*.git; do [ -d "$d" ] && basename "$d"; done
+}
+
+discover() {  # names of a peer's bares: tandem list, else find, else our own set
+    local host="$1" names
+    names="$(ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" 'tandem list' 2>/dev/null)"
+    [ -n "$names" ] || names="$(ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" \
+        "find '$REMOTE_BARE_DIR' -maxdepth 1 -type d -name '*.git' -exec basename {} ;" 2>/dev/null)"
+    [ -n "$names" ] || names="$(cmd_list)"
+    printf '%s\n' "$names"
+}
+
+pull_from_peer() {  # <peer-name> <host>
+    local name="$1" host="$2" n mirror source err updated=0 created=0 failed=0
+    local -a diverged=()
+    if ! ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" true >/dev/null 2>&1; then
+        printf '%s %-10s unavailable; skipped.\n' "$(date '+%F %T')" "$name"; return 0
+    fi
+
+    # Refresh working trees' tracking refs for this peer (no working-tree change).
+    local gitdir repo
+    while IFS= read -r gitdir; do
+        repo="${gitdir%/.git}"
+        git -C "$repo" remote get-url "$name" >/dev/null 2>&1 || continue
+        GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=$TIMEOUT" \
+            git -C "$repo" fetch --prune --quiet "$name" 2>/dev/null || true
+    done < <(find "$PROJECTS_DIR" -type d -name .git -print 2>/dev/null)
+
+    mkdir -p "$BARE_DIR"
+    export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=$TIMEOUT"
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue; case "$n" in *.git) ;; *) continue ;; esac
+        mirror="$BARE_DIR/$n"; source="$host:$REMOTE_BARE_DIR/$n"
+        if [ ! -d "$mirror" ]; then
+            git init --bare --initial-branch=main "$mirror" >/dev/null 2>&1 && created=$((created + 1)) || { failed=$((failed + 1)); continue; }
+        fi
+        # No leading + and no prune: only fast-forwards and new refs land.
+        if err="$(git -C "$mirror" fetch "$source" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' 2>&1)"; then updated=$((updated + 1))
+        elif printf '%s' "$err" | grep -qiE 'rejected|non-fast-forward|forced update'; then diverged+=("$n")
+        else failed=$((failed + 1)); fi
+    done < <(discover "$host")
+    unset GIT_SSH_COMMAND
+
+    printf '%s from %-10s updated=%d created=%d diverged=%d failed=%d\n' \
+        "$(date '+%F %T')" "$name" "$updated" "$created" "${#diverged[@]}" "$failed"
+    local d; for d in ${diverged[@]+"${diverged[@]}"}; do printf '  DIVERGED — left for review: %s\n' "$d"; done
+    return "$failed"
+}
+
+cmd_mirror() {
+    load_config
+    local i rc=0
+    [ "${#PEER_NAMES[@]}" -gt 0 ] || { printf 'No peers configured; nothing to mirror.\n'; return 0; }
+    for i in "${!PEER_NAMES[@]}"; do
+        pull_from_peer "${PEER_NAMES[$i]}" "${PEER_HOSTS[$i]}" || rc=1
+    done
+    return "$rc"
+}
+
+# ---------------------------------------------------------------- serve
+# The one command a replication key may run: fetch, push, or list, confined to
+# a bare repo directly under BARE_DIR. Goes in authorized_keys as command="...".
+cmd_serve() {
+    load_config
+    set -f
+    local c="${SSH_ORIGINAL_COMMAND:-}"
+    if [ "$c" = "tandem list" ]; then exec "$(resolve_self)" list; fi
+    if [[ "$c" =~ ^(git-upload-pack|git-receive-pack)\ \'([^\']+)\'$ ]]; then
+        local verb="${BASH_REMATCH[1]}" path="${BASH_REMATCH[2]}"
+        case "$path" in
+            "$BARE_DIR"/*.git) case "$path" in *..*) ;; *) exec "/usr/bin/$verb" "$path" ;; esac ;;
+        esac
+    fi
+    printf 'This key is restricted to Git replication.\n' >&2
+    exit 126
+}
+
+# ---------------------------------------------------------------- status
+cmd_status() {
+    load_config
+    case "${1:-}" in
+        --all)   status_all ;;
+        --bares) status_bares ;;
+        '')      status_here ;;
+        *)       die 2 "Unknown option for status: $1" 'Try: tandem help' ;;
+    esac
+}
+
+status_all() {
+    [ -s "$SYNC_LOG" ] || { printf 'No repositories have been synchronized yet.\n'; return 0; }
+    printf '%-28s %-12s %-14s %s\n' 'LAST SYNCED' 'REMOTE' 'BRANCH' 'REPOSITORY'
+    awk -F'\t' '{k=$2"\t"$3; t[k]=$1; b[k]=$4} END{for(k in t) print t[k]"\t"k"\t"b[k]}' "$SYNC_LOG" |
+        sort -rn | while IFS=$'\t' read -r when repo rem br; do
+            [ -d "$repo" ] || repo="$repo (missing)"
+            printf '%-28s %-12s %-14s %s\n' "$(stamp "$when")" "$rem" "$br" "${repo/#$HOME/~}"
+        done
+}
+
+status_bares() {
+    [ -d "$BARE_DIR" ] && [ -n "$(cmd_list)" ] || { printf 'No bare repos under %s yet.\n' "$BARE_DIR"; return 0; }
+    printf '%-30s %s\n' 'BARE' 'NEWEST ON main'
+    local name head
+    while IFS= read -r name; do
+        head="$(git -C "$BARE_DIR/$name" log -1 --format='%h  %cr  %s' main 2>/dev/null)"
+        [ -n "$head" ] || head='(no main branch)'
+        printf '%-30s %s\n' "$name" "$head"
+    done < <(cmd_list)
+}
+
+status_here() {
+    require_repo
+    local root git_dir branch rem ref counts ahead behind found=0
+    root="$(git rev-parse --show-toplevel)"; git_dir="$(git rev-parse --git-dir)"
+    branch="$(git symbolic-ref --quiet --short HEAD || printf '(detached HEAD)')"
+    printf 'repository   %s\n' "${root/#$HOME/~}"
+    printf 'branch       %s\n' "$branch"
+    printf 'last fetch   %s\n' "$(stamp "$(mtime "$git_dir/FETCH_HEAD")")"
+    [ -z "$(git status --porcelain --untracked-files=all)" ] || printf 'working tree has uncommitted changes\n'
+
+    while IFS= read -r rem; do
+        [ -n "$rem" ] || continue; found=1
+        printf '\n%s (%s)\n' "$rem" "$(role_of "$rem")"
+        printf '  url        %s\n' "$(git remote get-url "$rem")"
+        printf '  last sync  %s\n' "$(stamp "$(last_sync_epoch "$root" "$rem")")"
+        ref="refs/remotes/$rem/$branch"
+        if git show-ref --verify --quiet "$ref"; then
+            counts="$(git rev-list --left-right --count "HEAD...$ref")"
+            ahead="$(printf '%s' "$counts" | cut -f1)"; behind="$(printf '%s' "$counts" | cut -f2)"
+            if [ "$ahead" = 0 ] && [ "$behind" = 0 ]; then printf '  state      up to date as of the last fetch\n'
+            else printf '  state      %s ahead, %s behind as of the last fetch\n' "$ahead" "$behind"; fi
+        else printf '  state      %s/%s does not exist yet — `tandem sync` would create it\n' "$rem" "$branch"; fi
+    done < <(configured_remotes)
+
+    [ "$found" = 1 ] || printf '\nNone of these machine remotes are configured here: %s\n' "$(machine_names | tr '\n' ' ')"
+    if looks_like_ours && adopt_needed; then printf '\nnote: remotes do not match this machine; `tandem sync` will adopt them first.\n'; fi
+    printf '\nThis reflects the last fetch only; run `tandem sync` to contact the remotes.\n'
+}
+
+# ---------------------------------------------------------------- install
+plist_path() { printf '%s/Library/LaunchAgents/local.tandem.mirror.plist' "$HOME"; }
+
+cmd_install() {
+    load_config
+    command -v launchctl >/dev/null 2>&1 || die 2 'tandem install currently supports macOS (launchd) only.'
+    local self plist interval="${1:-300}" log
+    self="$(resolve_self)"; plist="$(plist_path)"; log="$STATE_DIR/mirror.log"
+    mkdir -p "$STATE_DIR" "$HOME/Library/LaunchAgents"
+    cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>local.tandem.mirror</string>
+    <key>ProgramArguments</key>
+    <array><string>$self</string><string>mirror</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>StartInterval</key><integer>$interval</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>$log</string>
+    <key>StandardErrorPath</key><string>$log</string>
+</dict>
+</plist>
+PLIST
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl load "$plist"
+    printf 'Installed local.tandem.mirror: every %ss, `tandem mirror`. Log: %s\n' "$interval" "$log"
+}
+
+cmd_uninstall() {
+    command -v launchctl >/dev/null 2>&1 || die 2 'Nothing to uninstall (launchd not present).'
+    local plist; plist="$(plist_path)"
+    [ -f "$plist" ] || die 2 'No tandem mirror timer is installed.'
+    launchctl unload "$plist" 2>/dev/null || true; rm -f "$plist"
+    printf 'Removed local.tandem.mirror.\n'
+}
+
+# ---------------------------------------------------------------- init
+cmd_init() {
+    if [ -f "$CONFIG" ]; then printf 'Config already exists: %s\n' "$CONFIG"; return 0; fi
+    mkdir -p "$(dirname "$CONFIG")"
+    cat > "$CONFIG" <<'CFG'
+# tandem configuration.
+#
+# machine       this machine's short name. It becomes the name of this machine's
+#               Git remote in every repo, and the required (local) one here.
+# bare_dir      where bare repositories live on this machine.
+# projects_dir  where working repositories live (for tracking-ref refresh).
+# timeout       seconds to wait on an unreachable peer.
+# peer <name> = <ssh-host>   one line per other machine. <name> becomes that
+#               machine's remote name; <ssh-host> is how to reach it over SSH.
+
+machine = this-machine
+bare_dir = ~/GitRemotes
+projects_dir = ~/Projects
+timeout = 5
+
+# peer laptop = laptop.local
+# peer desktop = desktop.example.com
+CFG
+    printf 'Wrote a starter config: %s\n' "$CONFIG"
+    printf 'Edit it to set this machine name and your peers, then `tandem adopt` in a repo.\n'
+}
+
+usage() { awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$(resolve_self)"; }
+
+case "${1:-}" in
+    sync)      cmd_sync ;;
+    mirror)    cmd_mirror ;;
+    adopt)     cmd_adopt ;;
+    status)    shift; cmd_status "${1:-}" ;;
+    list)      load_config; cmd_list ;;
+    serve)     cmd_serve ;;
+    install)   shift; cmd_install "${1:-}" ;;
+    uninstall) cmd_uninstall ;;
+    init)      cmd_init ;;
+    version | --version) printf 'tandem %s\n' "$VERSION" ;;
+    -h | --help | help | '') usage ;;
+    *) die 2 "Unknown command: $1" 'Try: tandem help' ;;
+esac
