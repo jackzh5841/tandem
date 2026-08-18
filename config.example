@@ -1,0 +1,17 @@
+# Example tandem config. Copy to ~/.config/tandem/config and edit.
+#
+# machine       this machine's short name; becomes its Git remote name in every
+#               repo, and the required (local) remote here.
+# bare_dir      where bare repositories live on this machine.
+# projects_dir  where working repositories live (for tracking-ref refresh).
+# timeout       seconds to wait on an unreachable peer.
+# remote_bare_dir  bare_dir path on peers, if it differs (defaults to bare_dir).
+# peer <name> = <ssh-host>   one line per other machine.
+
+machine = desktop
+bare_dir = ~/GitRemotes
+projects_dir = ~/Projects
+timeout = 5
+
+peer laptop = laptop.local
+# peer server = git.example.com
