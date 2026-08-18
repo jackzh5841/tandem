@@ -138,13 +138,22 @@ auto-adopt check). Per-remote `git config remote.<name>.sshCommand` is honored.
 ## Limitations
 
 - The background timer is macOS/`launchd` only. `sync`/`mirror`/`serve` work on
-  any Unix with Bash and Git; a systemd timer equivalent is left as an exercise.
+  any Unix with Bash and Git — **feel free to branch and port the timer to other
+  platforms** (a Linux/systemd version is the obvious next step; the OS-specific
+  code is isolated to `install`/`uninstall`). See [CONTRIBUTING.md](CONTRIBUTING.md).
 - Assumes the same `bare_dir` path on every machine (override with
   `remote_bare_dir`).
 - New *repositories* are discovered from peers automatically; brand-new
   *branches* replicate, but branch *deletions* do not (by design — nothing is
   pruned).
 
+## Contributing
+
+Ports to other platforms and other help are welcome — the one rule is that a
+change must never be able to lose unsynced work or auto-resolve a conflict. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the invariants, the code style (single
+Bash script, bash 3.2), and how to test.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Copyright © 2026 Jack Zhang.
