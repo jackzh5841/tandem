@@ -4,6 +4,16 @@ All notable changes to tandem are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] — 2026-08-18
+
+### Changed
+
+- Clearer message when `sync` is run in a repository that has remotes but none
+  are tandem machines. Instead of "none of these machine remotes… run adopt", it
+  now says the repository is hosted elsewhere and suggests `git push` (with
+  `tandem adopt` offered only as the way to deliberately add it to tandem). A
+  repository with no remotes at all still points you to `tandem adopt`.
+
 ## [0.2.1] — 2026-08-18
 
 ### Fixed
@@ -53,6 +63,7 @@ Initial release.
   `tandem mirror` (macOS).
 - Config-driven for any number of machines via `~/.config/tandem/config`.
 
+[0.2.2]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.1.0
