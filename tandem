@@ -27,7 +27,7 @@
 # anything, 4 no remote could be reached.
 set -uo pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 
 CONFIG="${TANDEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tandem/config}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tandem"
@@ -258,9 +258,15 @@ cmd_sync() {
     root="$(git rev-parse --show-toplevel)"
 
     while IFS= read -r rem; do [ -n "$rem" ] && remotes+=("$rem"); done < <(configured_remotes)
-    [ "${#remotes[@]}" -gt 0 ] ||
-        die 2 "This repo has none of these machine remotes: $(machine_names | tr '\n' ' ')" \
-              'Run `tandem adopt` to set them up.'
+    if [ "${#remotes[@]}" -eq 0 ]; then
+        local others; others="$(git remote 2>/dev/null | tr '\n' ' ')"
+        if [ -n "$others" ]; then
+            die 2 "This repository is hosted elsewhere (remotes: ${others% }), not on your tandem machines." \
+                  'Use `git push` to publish it, or `tandem adopt` to add it to tandem.'
+        fi
+        die 2 'This repository has no remotes yet.' \
+              'Run `tandem adopt` to wire up your machine remotes.'
+    fi
 
     for rem in "${remotes[@]}"; do
         printf 'Last synchronized with %-10s %s\n' "$rem:" "$(stamp "$(last_sync_epoch "$root" "$rem")")"
