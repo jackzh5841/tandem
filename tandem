@@ -27,7 +27,7 @@
 # anything, 4 no remote could be reached.
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 CONFIG="${TANDEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tandem/config}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tandem"
@@ -185,6 +185,10 @@ set_remote() {  # <name> <url>  — only ever touches the named remote
 looks_like_ours() {
     local m root
     while IFS= read -r m; do has_remote "$m" && return 0; done < <(machine_names)
+    # Only claim a fresh repo (no remotes) under projects_dir. A repo that already
+    # has an origin is hosted elsewhere — leave it for an explicit `tandem adopt`,
+    # so running `tandem sync` in it never sweeps it into the mesh.
+    [ -z "$(git remote 2>/dev/null)" ] || return 1
     root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
     case "$root/" in "$PROJECTS_DIR"/*) return 0 ;; esac
     return 1

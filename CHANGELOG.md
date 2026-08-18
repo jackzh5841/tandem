@@ -4,6 +4,17 @@ All notable changes to tandem are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-08-18
+
+### Fixed
+
+- `sync` no longer auto-adopts a repository that is hosted elsewhere. The
+  auto-adopt check claimed any repo under `projects_dir`, so running
+  `tandem sync` inside a project that only had an external `origin` (e.g. a
+  GitHub clone) swept it into the mesh — adding remotes and creating a stray
+  bare. It now claims only a *fresh* repo with no remotes at all; a repo that
+  already has an origin is left alone unless `tandem adopt` is run explicitly.
+
 ## [0.2.0] — 2026-08-18
 
 ### Added
@@ -42,5 +53,6 @@ Initial release.
   `tandem mirror` (macOS).
 - Config-driven for any number of machines via `~/.config/tandem/config`.
 
+[0.2.1]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.1.0
