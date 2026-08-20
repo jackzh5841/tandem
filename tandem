@@ -27,14 +27,28 @@
 # anything, 4 no remote could be reached.
 set -uo pipefail
 
-VERSION="0.2.2"
+VERSION="0.3.0"
 
 CONFIG="${TANDEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tandem/config}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tandem"
 SYNC_LOG="$STATE_DIR/sync.tsv"
 
 # ---------------------------------------------------------------- small helpers
-die() { local s="$1"; shift; printf '%s\n' "$@" >&2; exit "$s"; }
+# Highlight outcomes only when the stream is a terminal, so timer logs and
+# pipes stay plain. NO_COLOR disables color everywhere.
+paint() {  # paint <fd> <ansi-color> <text>
+    if [ -z "${NO_COLOR:-}" ] && [ -t "$1" ]; then
+        printf '\033[%sm%s\033[0m\n' "$2" "$3"
+    else
+        printf '%s\n' "$3"
+    fi
+}
+ok()   { paint 1 32 "$*"; }         # success, stdout
+note() { paint 1 33 "$*"; }         # warning that belongs on stdout
+warn() { paint 2 33 "$*" >&2; }     # warning on stderr
+err()  { paint 2 31 "$*" >&2; }     # error on stderr
+
+die() { local s="$1"; shift; local m; for m in "$@"; do err "$m"; done; exit "$s"; }
 
 trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
 
@@ -247,7 +261,8 @@ cmd_sync() {
     require_repo; load_config
 
     if [ -z "${TANDEM_NO_ADOPT:-}" ] && looks_like_ours && adopt_needed; then
-        printf 'Remotes do not match this machine — adopting first.\n\n'
+        note 'Remotes do not match this machine — adopting first.'
+        printf '\n'
         adopt_core; printf '\n'
     fi
 
@@ -276,7 +291,7 @@ cmd_sync() {
         printf 'Fetching %s...\n' "$rem"
         if git_on "$rem" fetch --prune "$rem"; then live+=("$rem")
         elif remote_is_local "$rem"; then die 3 '' "The local repo for $rem could not be read." 'Nothing was changed.'
-        else printf '%s could not be reached — carrying on without it.\n' "$rem" >&2; fi
+        else warn "$rem could not be reached — carrying on without it."; fi
     done
 
     local rc
@@ -286,9 +301,9 @@ cmd_sync() {
         case "$rc" in
             0) pushable+=("$rem") ;;
             1) if remote_is_local "$rem"; then die 3 '' "Local and $rem $branch have diverged. Nothing was pushed." 'Resolve the histories explicitly first.'; fi
-               printf 'Local and %s %s have diverged — skipping it.\n' "$rem" "$branch" >&2 ;;
+               warn "Local and $rem $branch have diverged — skipping it." ;;
             2) if remote_is_local "$rem"; then die 3 '' "$rem $branch is ahead but this working tree is dirty." 'Commit, stash, or resolve the local work first.'; fi
-               printf '%s is ahead but this working tree is dirty — skipping it.\n' "$rem" >&2 ;;
+               warn "$rem is ahead but this working tree is dirty — skipping it." ;;
         esac
     done
 
@@ -297,7 +312,7 @@ cmd_sync() {
         if git_on "$rem" push --follow-tags "$rem" "HEAD:refs/heads/$branch"; then
             record_sync "$root" "$rem" "$branch" "$(git rev-parse HEAD)"; synced=$((synced + 1))
         elif remote_is_local "$rem"; then die 3 '' "Pushing to $rem failed." 'Nothing further was attempted.'
-        else printf 'Pushing to %s failed — it is not synchronized.\n' "$rem" >&2; fi
+        else warn "Pushing to $rem failed — it is not synchronized."; fi
     done
 
     # Track the local machine's branch when it exists.
@@ -307,8 +322,8 @@ cmd_sync() {
 
     [ "$synced" -gt 0 ] || die 4 '' 'No remote could be reached. Nothing was synchronized.' \
         'Your commits are safe locally; run `tandem sync` again when a remote is available.'
-    if [ "$synced" -lt "${#remotes[@]}" ]; then printf 'Synchronized with %d of %d remotes.\n' "$synced" "${#remotes[@]}"
-    else printf 'Synchronized successfully.\n'; fi
+    if [ "$synced" -lt "${#remotes[@]}" ]; then note "Synchronized with $synced of ${#remotes[@]} remotes."
+    else ok 'Synchronized successfully.'; fi
 }
 
 # ---------------------------------------------------------------- mirror
@@ -330,7 +345,7 @@ pull_from_peer() {  # <peer-name> <host>
     local name="$1" host="$2" n mirror source err updated=0 created=0 failed=0
     local -a diverged=()
     if ! ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" true >/dev/null 2>&1; then
-        printf '%s %-10s unavailable; skipped.\n' "$(date '+%F %T')" "$name"; return 0
+        note "$(printf '%s %-10s unavailable; skipped.' "$(date '+%F %T')" "$name")"; return 0
     fi
 
     # Refresh working trees' tracking refs for this peer (no working-tree change).
@@ -357,9 +372,16 @@ pull_from_peer() {  # <peer-name> <host>
     done < <(discover "$host")
     unset GIT_SSH_COMMAND
 
-    printf '%s from %-10s updated=%d created=%d diverged=%d failed=%d\n' \
-        "$(date '+%F %T')" "$name" "$updated" "$created" "${#diverged[@]}" "$failed"
-    local d; for d in ${diverged[@]+"${diverged[@]}"}; do printf '  DIVERGED — left for review: %s\n' "$d"; done
+    # Color the summary by its worst outcome: red for hard failures, yellow for
+    # divergence awaiting review, green for a clean run.
+    local summary
+    summary="$(printf '%s from %-10s updated=%d created=%d diverged=%d failed=%d' \
+        "$(date '+%F %T')" "$name" "$updated" "$created" "${#diverged[@]}" "$failed")"
+    if   [ "$failed" -gt 0 ];         then paint 1 31 "$summary"
+    elif [ "${#diverged[@]}" -gt 0 ]; then note "$summary"
+    else                                   ok "$summary"
+    fi
+    local d; for d in ${diverged[@]+"${diverged[@]}"}; do note "  DIVERGED — left for review: $d"; done
     return "$failed"
 }
 
@@ -387,7 +409,7 @@ cmd_serve() {
             "$BARE_DIR"/*.git) case "$path" in *..*) ;; *) exec "/usr/bin/$verb" "$path" ;; esac ;;
         esac
     fi
-    printf 'This key is restricted to Git replication.\n' >&2
+    err 'This key is restricted to Git replication.'
     exit 126
 }
 
@@ -431,7 +453,7 @@ status_here() {
     printf 'repository   %s\n' "${root/#$HOME/~}"
     printf 'branch       %s\n' "$branch"
     printf 'last fetch   %s\n' "$(stamp "$(mtime "$git_dir/FETCH_HEAD")")"
-    [ -z "$(git status --porcelain --untracked-files=all)" ] || printf 'working tree has uncommitted changes\n'
+    [ -z "$(git status --porcelain --untracked-files=all)" ] || note 'working tree has uncommitted changes'
 
     while IFS= read -r rem; do
         [ -n "$rem" ] || continue; found=1
@@ -448,7 +470,7 @@ status_here() {
     done < <(configured_remotes)
 
     [ "$found" = 1 ] || printf '\nNone of these machine remotes are configured here: %s\n' "$(machine_names | tr '\n' ' ')"
-    if looks_like_ours && adopt_needed; then printf '\nnote: remotes do not match this machine; `tandem sync` will adopt them first.\n'; fi
+    if looks_like_ours && adopt_needed; then printf '\n'; note 'note: remotes do not match this machine; `tandem sync` will adopt them first.'; fi
     printf '\nThis reflects the last fetch only; run `tandem sync` to contact the remotes.\n'
 }
 
@@ -500,7 +522,7 @@ install_launchd() {
 PLIST
     launchctl unload "$plist" 2>/dev/null || true
     launchctl load "$plist"
-    printf 'Installed local.tandem.mirror (launchd): every %ss, `tandem mirror`. Log: %s\n' "$interval" "$log"
+    ok "Installed local.tandem.mirror (launchd): every ${interval}s, \`tandem mirror\`. Log: $log"
 }
 
 uninstall_launchd() {
@@ -508,7 +530,7 @@ uninstall_launchd() {
     local plist; plist="$(plist_path)"
     [ -f "$plist" ] || die 2 'No tandem mirror timer is installed.'
     launchctl unload "$plist" 2>/dev/null || true; rm -f "$plist"
-    printf 'Removed local.tandem.mirror (launchd).\n'
+    ok 'Removed local.tandem.mirror (launchd).'
 }
 
 install_systemd() {
@@ -539,7 +561,7 @@ WantedBy=timers.target
 UNIT
     systemctl --user daemon-reload
     systemctl --user enable --now tandem-mirror.timer
-    printf 'Installed tandem-mirror.timer (systemd --user): every %ss, `tandem mirror`.\n' "$interval"
+    ok "Installed tandem-mirror.timer (systemd --user): every ${interval}s, \`tandem mirror\`."
     printf 'Logs: journalctl --user -u tandem-mirror. To run while logged out: loginctl enable-linger %s\n' "${USER:-$(id -un)}"
 }
 
@@ -549,7 +571,7 @@ uninstall_systemd() {
     systemctl --user disable --now tandem-mirror.timer 2>/dev/null || true
     rm -f "$dir/tandem-mirror.timer" "$dir/tandem-mirror.service"
     systemctl --user daemon-reload 2>/dev/null || true
-    printf 'Removed tandem-mirror.timer (systemd --user).\n'
+    ok 'Removed tandem-mirror.timer (systemd --user).'
 }
 
 # ---------------------------------------------------------------- init
@@ -575,7 +597,7 @@ timeout = 5
 # peer laptop = laptop.local
 # peer desktop = desktop.example.com
 CFG
-    printf 'Wrote a starter config: %s\n' "$CONFIG"
+    ok "Wrote a starter config: $CONFIG"
     printf 'Edit it to set this machine name and your peers, then `tandem adopt` in a repo.\n'
 }
 

@@ -4,6 +4,17 @@ All notable changes to tandem are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-08-19
+
+### Added
+
+- Colored outcome messages: success prints green, warnings (an unreachable
+  peer, a diverged or skipped branch, a partial sync) yellow, and errors red.
+  The `mirror` summary line is colored by its worst outcome. Color is applied
+  only when the stream is a terminal, so timer logs and pipes stay plain, and
+  setting `NO_COLOR` disables it everywhere. Message text, streams, and exit
+  codes are unchanged.
+
 ## [0.2.2] — 2026-08-18
 
 ### Changed
@@ -63,6 +74,7 @@ Initial release.
   `tandem mirror` (macOS).
 - Config-driven for any number of machines via `~/.config/tandem/config`.
 
+[0.3.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.3.0
 [0.2.2]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.0
