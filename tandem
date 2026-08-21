@@ -27,7 +27,7 @@
 # anything, 4 no remote could be reached.
 set -uo pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 CONFIG="${TANDEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tandem/config}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tandem"
@@ -239,6 +239,19 @@ adopt_core() {
         printf '  created local bare  %s\n' "$bare"
     fi
     while IFS= read -r m; do set_remote "$m" "$(url_for "$m" "$name")"; done < <(machine_names)
+
+    # A clone made straight from a bare leaves an `origin` duplicating one of
+    # the machine remotes just set. Drop exactly that duplicate; an origin
+    # pointing anywhere else (e.g. a hosting provider) is never touched.
+    local ourl
+    if ourl="$(git remote get-url origin 2>/dev/null)"; then
+        while IFS= read -r m; do
+            [ "$ourl" = "$(git remote get-url "$m" 2>/dev/null)" ] || continue
+            git remote remove origin
+            printf '  %-10s removed    %s (duplicate of %s)\n' origin "$ourl" "$m"
+            break
+        done < <(machine_names)
+    fi
     printf '\n%s is %s.\n' "$MACHINE" "$(role_of "$MACHINE")"
 }
 
@@ -344,7 +357,11 @@ discover() {  # names of a peer's bares: tandem list, else find, else our own se
 pull_from_peer() {  # <peer-name> <host>
     local name="$1" host="$2" n mirror source err updated=0 created=0 failed=0
     local -a diverged=()
-    if ! ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" true >/dev/null 2>&1; then
+    # Reachability probe. ssh exits 255 only for its own failures (unreachable,
+    # auth); any other status came from the peer, so the link is up — a
+    # replication-restricted key refuses `true` yet still permits fetching.
+    ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" true >/dev/null 2>&1
+    if [ $? -eq 255 ]; then
         note "$(printf '%s %-10s unavailable; skipped.' "$(date '+%F %T')" "$name")"; return 0
     fi
 

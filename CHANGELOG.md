@@ -4,6 +4,18 @@ All notable changes to tandem are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — 2026-08-21
+
+### Fixed
+
+- `mirror` no longer reports a healthy peer as unavailable when its SSH key is
+  restricted to `tandem serve`. The reachability probe ran `true` on the peer,
+  which a replication-only key refuses; now only ssh's own failure (exit 255)
+  counts as unreachable.
+- `adopt` removes a leftover `origin` that duplicates one of the machine
+  remotes it just set — the remnant of cloning a bare directly. An `origin`
+  pointing anywhere else (e.g. a hosting provider) is never touched.
+
 ## [0.3.0] — 2026-08-19
 
 ### Added
@@ -74,6 +86,7 @@ Initial release.
   `tandem mirror` (macOS).
 - Config-driven for any number of machines via `~/.config/tandem/config`.
 
+[0.3.1]: https://github.com/jackzh5841/tandem/releases/tag/v0.3.1
 [0.3.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.3.0
 [0.2.2]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.2
 [0.2.1]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.1
