@@ -6,7 +6,9 @@
 # projects_dir  where working repositories live (for tracking-ref refresh).
 # timeout       seconds to wait on an unreachable peer.
 # remote_bare_dir  bare_dir path on peers, if it differs (defaults to bare_dir).
-# peer <name> = <ssh-host>   one line per other machine.
+# battery_interval  on battery (macOS only), seconds a mirror run waits after the
+#               last one began; 0 runs at the timer's interval. Default 1800.
+# peer <name> = <ssh-host>   one line per other machine, never this machine itself.
 
 machine = desktop
 bare_dir = ~/GitRemotes

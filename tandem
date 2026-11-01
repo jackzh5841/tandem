@@ -8,6 +8,8 @@
 #   tandem adopt       (re)point this repo's remotes at the machine it sits on
 #   tandem status      what this repo (or --all, or --bares) knows, offline
 #   tandem list        print this machine's bare repo names (used by mirror)
+#   tandem refs        print every local bare's heads and tags (used by mirror,
+#                      so a peer fetches only what moved)
 #   tandem serve       SSH forced command: permit only replication (for authorized_keys)
 #   tandem install     install a background timer (launchd/systemd) for `tandem mirror`
 #   tandem uninstall   remove that timer
@@ -21,13 +23,19 @@
 # is what keeps a laptop useful off the network: it commits into its own bare
 # repo and can restore from it fully offline.
 #
+# A mirror run holds one SSH connection per peer, asks the peer for its refs,
+# and fetches only the repos that moved there: a quiet run fetches nothing. A
+# peer line that names this machine itself is skipped, and install refuses it.
+# On battery (macOS) a run waits battery_interval seconds after the last one
+# began, 30 minutes by default, rather than running at the timer's every tick.
+#
 # Configuration lives at ${TANDEM_CONFIG:-~/.config/tandem/config}. See `tandem init`.
 #
 # Exit status: 0 ok, 2 misconfigured / cannot run here, 3 refused to change
 # anything, 4 no remote could be reached.
 set -uo pipefail
 
-VERSION="0.3.1"
+VERSION="0.4.0"
 
 CONFIG="${TANDEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tandem/config}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tandem"
@@ -49,6 +57,7 @@ warn() { paint 2 33 "$*" >&2; }     # warning on stderr
 err()  { paint 2 31 "$*" >&2; }     # error on stderr
 
 die() { local s="$1"; shift; local m; for m in "$@"; do err "$m"; done; exit "$s"; }
+ts()  { date '+%F %T'; }
 
 trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
 
@@ -89,6 +98,7 @@ resolve_self() {
 
 # ---------------------------------------------------------------- config
 MACHINE=""; BARE_DIR=""; PROJECTS_DIR=""; REMOTE_BARE_DIR=""; TIMEOUT=5
+BATTERY_INTERVAL=1800
 PEER_NAMES=(); PEER_HOSTS=()
 
 load_config() {
@@ -112,6 +122,7 @@ load_config() {
                     projects_dir)    PROJECTS_DIR="$(expand_tilde "$val")" ;;
                     remote_bare_dir) REMOTE_BARE_DIR="$val" ;;
                     timeout)         TIMEOUT="$val" ;;
+                    battery_interval) BATTERY_INTERVAL="$val" ;;
                 esac
                 ;;
         esac
@@ -120,6 +131,9 @@ load_config() {
     [ -n "$BARE_DIR" ] || BARE_DIR="$HOME/GitRemotes"
     [ -n "$PROJECTS_DIR" ] || PROJECTS_DIR="$HOME/Projects"
     [ -n "$REMOTE_BARE_DIR" ] || REMOTE_BARE_DIR="$BARE_DIR"
+    case "$BATTERY_INTERVAL" in
+        ''|*[!0-9]*) die 2 "config: battery_interval must be a whole number of seconds (0 to disable), not '$BATTERY_INTERVAL'" ;;
+    esac
 }
 
 # Every machine name, this one first.
@@ -345,61 +359,347 @@ cmd_list() {
     local d; for d in "$BARE_DIR"/*.git; do [ -d "$d" ] && basename "$d"; done
 }
 
+# Every head and tag of every local bare: what a peer's mirror compares with
+# its own copies, so it fetches only what moved. Each bare read is a line of
+# its name alone, then one "<bare>\t<sha> <ref>" line per head and tag, so an
+# empty bare is its name and nothing after it. A bare whose refs cannot be
+# read is left out, and a peer fetches whatever it is not told about, so a
+# gap here costs a fetch and never a skipped one. --git-dir, not -C: from a
+# folder that is not a repository, -C searches upward, and a home folder kept
+# as a dotfiles repository would answer for it.
+REF_FORMAT='%(objectname) %(refname)'
+
+cmd_refs() {
+    local n refs line
+    while IFS= read -r n; do
+        refs="$(git --git-dir="$BARE_DIR/$n" for-each-ref --format="$REF_FORMAT" \
+                    refs/heads refs/tags 2>/dev/null)" || continue
+        printf '%s\n' "$n"
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then printf '%s\t%s\n' "$n" "$line"; fi
+        done <<< "$refs"
+    done < <(cmd_list)
+    return 0    # an empty bare's last test is "no line", and that is not a failure
+}
+
+# ---------------------------------------------------------------- this machine
+# Whether an SSH host is this machine. A peer line naming the machine it is
+# written on makes every mirror run an SSH connection to itself that can
+# only fail, and nothing in the log says so: a laptop did exactly that every
+# five minutes for two months. Decided without connecting: `ssh -G` reads
+# the config and prints the HostName it would reach, which is compared with
+# the names this machine answers to and the addresses on its interfaces
+# (Tailscale's 100.x and fd7a: among them). A name that only DNS maps here
+# (an /etc/hosts alias, a CNAME, a MagicDNS FQDN) is not recognised and is
+# mirrored from as before: the safe direction, since taking a real peer for
+# this machine would stop replication without a sound.
+
+# The HostName ssh would connect to: lowercased, as ssh prints it, with a
+# trailing dot and IPv6 brackets dropped. awk reads to the end because
+# stopping at the match would SIGPIPE ssh, and pipefail counts that.
+ssh_target() {
+    local t
+    t="$(ssh -G "$1" 2>/dev/null | awk '/^hostname / { h = $2 } END { print h }')"
+    [ -n "$t" ] || t="${1##*@}"         # a config ssh cannot read: the host as given
+    t="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')"
+    t="${t#\[}"; t="${t%\]}"
+    printf '%s' "${t%.}"
+}
+
+local_name() { scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null; }
+
+# Every name and address this machine answers to, lowercased, one to a line.
+# The addresses come from ifconfig; on a system without it, only the names
+# are known, and a peer given as this machine's address is mirrored from as
+# before.
+this_machine() {
+    local n
+    {
+        printf 'localhost\n'
+        n="$(local_name)"; [ -n "$n" ] && printf '%s\n%s.local\n' "$n" "$n"
+        n="$(hostname)";   [ -n "$n" ] && printf '%s\n%s\n' "$n" "${n%.local}"
+        ifconfig | awk '$1 == "inet" || $1 == "inet6" { sub(/%.*/, "", $2); print $2 }'
+    } 2>/dev/null | tr '[:upper:]' '[:lower:]'
+}
+
+is_this_machine() {  # is_this_machine <host>
+    local target
+    target="$(ssh_target "$1")"
+    [ -n "$target" ] &&
+        this_machine | awk -v t="$target" '$0 == t { hit = 1 } END { exit !hit }'
+}
+
+# ---------------------------------------------------------------- battery
+# On battery a mirror run waits battery_interval seconds after the last one
+# began, rather than running at the timer's every interval; on mains power,
+# and on a machine with no battery, nothing changes. Stretched rather than
+# stopped: a laptop's bares are its travel copy, so one unplugged for an
+# evening still leaves with its peers' work at most this old. A `tandem
+# sync` typed by hand reaches the peers itself, whatever this says. The
+# power source is read with pmset, which is macOS's: elsewhere, and
+# wherever pmset is missing, this reads as mains power and the run goes
+# ahead, so on Linux the timer's interval is the only one.
+on_battery() {
+    pmset -g batt 2>/dev/null |
+        awk 'NR == 1 && /Battery Power/ { b = 1 } END { exit !b }'
+}
+
+battery_allows() {  # battery_allows <peer>: true to mirror now, else says why not
+    local began="$STATE_DIR/mirror-$1.began" last age
+    [ "$BATTERY_INTERVAL" -gt 0 ] || return 0
+    if on_battery && [ -f "$began" ]; then
+        last="$(mtime "$began")"
+        age=$(( $(date +%s) - ${last:-0} ))
+        # A negative age is a clock set back: mirror rather than wait it out.
+        if [ "$age" -ge 0 ] && [ "$age" -lt "$BATTERY_INTERVAL" ]; then
+            printf '%s %-10s on battery: the last mirror began %dm ago; the next waits for %dm.\n' \
+                "$(ts)" "$1" $((age / 60)) $((BATTERY_INTERVAL / 60))
+            return 1
+        fi
+    fi
+    # A stamp that cannot be written costs the wait, not the run: the error
+    # goes to the log, and the run goes ahead.
+    mkdir -p "$STATE_DIR" && touch "$began"
+    return 0
+}
+
+# ---------------------------------------------------------------- connection
+# One SSH connection per peer per run. The probe opens it as a master, and
+# the listing, the refs and every fetch ride on it as sessions; before 0.4.0
+# each was a handshake of its own, one per repository, every run. The socket
+# goes in a directory of this run's own under /tmp rather than $TMPDIR: a
+# socket path holds 104 bytes, and $TMPDIR, %C's 40 and the 17 ssh adds
+# while it binds come to more. TANDEM_CONTROL_ROOT moves it, for tests.
+# ServerAlive bounds a peer that vanishes mid-run.
+CONTROL_ROOT="${TANDEM_CONTROL_ROOT:-/tmp}"
+SSH_OPTS=()
+CONTROL_DIR=''
+CONTROL_HOST=''
+
+open_connection() {  # open_connection <host>
+    CONTROL_HOST="$1"
+    SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout="$TIMEOUT")
+    if CONTROL_DIR="$(mktemp -d "$CONTROL_ROOT/tandem.XXXXXX")"; then
+        SSH_OPTS+=(-o ControlMaster=auto -o ControlPath="$CONTROL_DIR/%C"
+                   -o ControlPersist=60
+                   -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+        trap close_connection EXIT
+    else
+        CONTROL_DIR=''
+        warn "$(ts) No directory for a shared connection; each fetch opens its own."
+    fi
+    export GIT_SSH_COMMAND="ssh ${SSH_OPTS[*]}"
+}
+
+# Every master this peer's run opened (a working tree's remote may name
+# another host than the peer's), then the directory that held them.
+close_connection() {
+    local socket
+    unset GIT_SSH_COMMAND
+    [ -n "$CONTROL_DIR" ] || return 0
+    for socket in "$CONTROL_DIR"/*; do
+        [ -S "$socket" ] &&
+            ssh -o ControlPath="$socket" -O exit "$CONTROL_HOST" >/dev/null 2>&1
+    done
+    rm -rf "$CONTROL_DIR"
+    CONTROL_DIR=''
+    trap - EXIT
+}
+
+# ---------------------------------------------------------------- what moved
+# The peer's heads and tags, from `tandem refs` there, so a run fetches only
+# what moved; before 0.4.0 every run fetched every bare and every working
+# tree's remote, changed or not. A peer that does not answer (an older
+# tandem, a key restricted by an older serve, no tandem on its PATH) has
+# everything fetched, as before, and the log says so. A skip needs positive
+# evidence, so anything this cannot tell reads as "fetch": a repo the peer
+# did not read, a line from it that is not a sha and a ref, a local read
+# that failed.
+PEER_REFS=''
+PEER_REFS_KNOWN=0
+
+read_peer_refs() {  # read_peer_refs <peer-name> <host>
+    if PEER_REFS="$(ssh "${SSH_OPTS[@]}" "$2" 'tandem refs' 2>/dev/null)"; then
+        PEER_REFS_KNOWN=1
+    else
+        PEER_REFS=''; PEER_REFS_KNOWN=0
+        note "$(printf '%s %-10s did not answer `tandem refs`; fetching every repo.' "$(ts)" "$1")"
+    fi
+}
+
+peer_read() {  # peer_read <bare>: whether the peer read it, refs or none
+    printf '%s\n' "$PEER_REFS" |
+        bare="$1" awk -F '\t' 'NF == 1 && $1 == ENVIRON["bare"] { hit = 1 } END { exit !hit }'
+}
+
+peer_refs_of() {  # peer_refs_of <bare>: its "<sha> <ref>" lines
+    printf '%s\n' "$PEER_REFS" |
+        bare="$1" awk -F '\t' 'NF == 2 && $1 == ENVIRON["bare"] { print $2 }'
+}
+
+# The refspecs a bare needs from the peer, one a line: each head or tag the
+# peer has that this mirror lacks or holds at another commit. Not a head
+# whose peer commit this mirror already contains: this machine is ahead
+# there, and the peer takes it on its own run. Fetching that one is what git
+# calls non-fast-forward, and what this reported as DIVERGED, run after run,
+# until the peer caught up. Prints nothing when nothing moved, an empty bare
+# there among it; fails when it cannot tell.
+wanted() {  # wanted <bare> <mirror>
+    local theirs ours sha ref
+    [ "$PEER_REFS_KNOWN" = 1 ] || return 1
+    peer_read "$1" || return 1
+    theirs="$(peer_refs_of "$1")"
+    ours="$(git --git-dir="$2" for-each-ref --format="$REF_FORMAT" refs/heads refs/tags)" ||
+        return 1
+    while read -r sha ref; do
+        [ -n "$sha" ] || continue           # the one line a here-string of nothing gives
+        case $'\n'"$ours"$'\n' in *$'\n'"$sha $ref"$'\n'*) continue ;; esac
+        # The peer's words become a revision and a refspec here: a sha that
+        # is not one, or a ref that is not a well-formed head or tag (a
+        # leading + would force), and this cannot tell.
+        case "$sha" in *[!0-9a-f]*) return 1 ;; esac
+        [ "${#sha}" -eq 40 ] || [ "${#sha}" -eq 64 ] || return 1
+        case "$ref" in refs/heads/?*|refs/tags/?*) ;; *) return 1 ;; esac
+        git check-ref-format "$ref" || return 1
+        case "$ref" in
+            refs/heads/*)
+                git --git-dir="$2" merge-base --is-ancestor "$sha" "$ref" 2>/dev/null &&
+                    continue ;;
+        esac
+        printf '%s:%s\n' "$ref" "$ref"
+    done <<< "$theirs"
+}
+
+# Whether a working tree's tracking refs for the peer are already the
+# peer's. Only for a remote naming the peer's bare the way adopt writes it,
+# <host>:<remote_bare_dir>/<bare>, with the default refspec; any other
+# remote is fetched as before. Current means its refs/remotes/<name>/* are
+# the peer's heads exactly (a fetch --prune would drop one the peer no
+# longer has) and it holds every tag the peer has.
+tree_current() {  # tree_current <repo> <host> <name>
+    local url bare theirs ours mine='' sha ref head
+    [ "$PEER_REFS_KNOWN" = 1 ] || return 1
+    url="$(git -C "$1" remote get-url "$3" 2>/dev/null)" || return 1
+    bare="${url#"$2:$REMOTE_BARE_DIR/"}"
+    [ "$bare" != "$url" ] || return 1
+    case "$bare" in *.git) ;; *) return 1 ;; esac
+    case "$bare" in */*) return 1 ;; esac
+    [ "$(git -C "$1" config --get-all "remote.$3.fetch")" = "+refs/heads/*:refs/remotes/$3/*" ] ||
+        return 1
+    peer_read "$bare" || return 1
+    theirs="$(peer_refs_of "$bare")"
+    ours="$(git -C "$1" for-each-ref --format="$REF_FORMAT" "refs/remotes/$3" refs/tags)" ||
+        return 1
+    while read -r sha ref; do
+        [ -n "$sha" ] || continue
+        case "$ref" in
+            "refs/remotes/$3/HEAD") ;;                  # a pointer, not a branch
+            "refs/remotes/$3/"*)
+                head="$sha refs/heads/${ref#"refs/remotes/$3/"}"
+                case $'\n'"$theirs"$'\n' in *$'\n'"$head"$'\n'*) ;; *) return 1 ;; esac
+                mine+="$head"$'\n' ;;
+            *)  mine+="$sha $ref"$'\n' ;;
+        esac
+    done <<< "$ours"
+    while read -r sha ref; do
+        [ -n "$sha" ] || continue
+        case $'\n'"$mine" in *$'\n'"$sha $ref"$'\n'*) ;; *) return 1 ;; esac
+    done <<< "$theirs"
+}
+
+# ---------------------------------------------------------------- pull
 discover() {  # names of a peer's bares: tandem list, else find, else our own set
     local host="$1" names
-    names="$(ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" 'tandem list' 2>/dev/null)"
-    [ -n "$names" ] || names="$(ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" \
+    names="$(ssh "${SSH_OPTS[@]}" "$host" 'tandem list' 2>/dev/null)"
+    [ -n "$names" ] || names="$(ssh "${SSH_OPTS[@]}" "$host" \
         "find '$REMOTE_BARE_DIR' -maxdepth 1 -type d -name '*.git' -exec basename {} \;" 2>/dev/null)"
     [ -n "$names" ] || names="$(cmd_list)"
     printf '%s\n' "$names"
 }
 
 pull_from_peer() {  # <peer-name> <host>
-    local name="$1" host="$2" n mirror source err updated=0 created=0 failed=0
-    local -a diverged=()
+    local name="$1" host="$2" n mirror source err specs spec
+    local updated=0 unchanged=0 created=0 failed=0
+    local -a diverged=() failures=() refspecs=()
+
+    # From this machine there is nothing to mirror: say so before any
+    # connection. Status 0, as for an absent peer; the line tells them apart.
+    if is_this_machine "$host"; then
+        note "$(printf '%s %-10s is this machine (%s); nothing to mirror. Remove `peer %s = %s` from %s.' \
+            "$(ts)" "$name" "$(local_name)" "$name" "$host" "$CONFIG")"
+        return 0
+    fi
+    battery_allows "$name" || return 0
+    open_connection "$host"
+
     # Reachability probe. ssh exits 255 only for its own failures (unreachable,
     # auth); any other status came from the peer, so the link is up — a
     # replication-restricted key refuses `true` yet still permits fetching.
-    ssh -o BatchMode=yes -o ConnectTimeout="$TIMEOUT" "$host" true >/dev/null 2>&1
+    # Being first, it opens the connection everything after it shares.
+    ssh "${SSH_OPTS[@]}" "$host" true >/dev/null 2>&1
     if [ $? -eq 255 ]; then
-        note "$(printf '%s %-10s unavailable; skipped.' "$(date '+%F %T')" "$name")"; return 0
+        note "$(printf '%s %-10s unavailable; skipped.' "$(ts)" "$name")"
+        close_connection; return 0
     fi
+    read_peer_refs "$name" "$host"
 
-    # Refresh working trees' tracking refs for this peer (no working-tree change).
+    # Refresh working trees' tracking refs for this peer. This only moves
+    # refs/remotes/<name>/*; it never touches a working tree or a local branch.
     local gitdir repo
     while IFS= read -r gitdir; do
         repo="${gitdir%/.git}"
         git -C "$repo" remote get-url "$name" >/dev/null 2>&1 || continue
-        GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=$TIMEOUT" \
-            git -C "$repo" fetch --prune --quiet "$name" 2>/dev/null || true
+        tree_current "$repo" "$host" "$name" && continue
+        git -C "$repo" fetch --prune --quiet "$name" 2>/dev/null || true
     done < <(find "$PROJECTS_DIR" -type d -name .git -print 2>/dev/null)
 
     mkdir -p "$BARE_DIR"
-    export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=$TIMEOUT"
     while IFS= read -r n; do
         [ -n "$n" ] || continue; case "$n" in *.git) ;; *) continue ;; esac
+        # The peer named it, and a name is one path component: a name with a
+        # slash would put a bare, or a fetch, outside bare_dir.
+        case "$n" in */*|.*)
+            failed=$((failed + 1)); failures+=("$n: not a bare repo name, refused"); continue ;;
+        esac
         mirror="$BARE_DIR/$n"; source="$host:$REMOTE_BARE_DIR/$n"
         if [ ! -d "$mirror" ]; then
-            git init --bare --initial-branch=main "$mirror" >/dev/null 2>&1 && created=$((created + 1)) || { failed=$((failed + 1)); continue; }
+            if git init --bare --initial-branch=main "$mirror" >/dev/null 2>&1; then created=$((created + 1))
+            else failed=$((failed + 1)); failures+=("$n: could not make a bare here"); continue; fi
         fi
+        # Only what moved on the peer, or everything when that cannot be told.
+        if specs="$(wanted "$n" "$mirror")"; then
+            [ -n "$specs" ] || { unchanged=$((unchanged + 1)); continue; }
+        else
+            specs=$'refs/heads/*:refs/heads/*\nrefs/tags/*:refs/tags/*'
+        fi
+        refspecs=()
+        while IFS= read -r spec; do refspecs+=("$spec"); done <<< "$specs"
         # No leading + and no prune: only fast-forwards and new refs land.
-        if err="$(git -C "$mirror" fetch "$source" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' 2>&1)"; then updated=$((updated + 1))
+        if err="$(git -C "$mirror" fetch "$source" "${refspecs[@]}" 2>&1)"; then updated=$((updated + 1))
         elif printf '%s' "$err" | grep -qiE 'rejected|non-fast-forward|forced update'; then diverged+=("$n")
-        else failed=$((failed + 1)); fi
+        else
+            failed=$((failed + 1))
+            failures+=("$n: $(printf '%s\n' "$err" | awk 'NF && !line { line = $0 } END { print line }')")
+        fi
     done < <(discover "$host")
-    unset GIT_SSH_COMMAND
+    close_connection
 
     # Color the summary by its worst outcome: red for hard failures, yellow for
-    # divergence awaiting review, green for a clean run.
+    # divergence awaiting review, green for a clean run. updated counts the
+    # repos fetched, unchanged those the peer had nothing new in.
     local summary
-    summary="$(printf '%s from %-10s updated=%d created=%d diverged=%d failed=%d' \
-        "$(date '+%F %T')" "$name" "$updated" "$created" "${#diverged[@]}" "$failed")"
+    summary="$(printf '%s from %-10s updated=%d unchanged=%d created=%d diverged=%d failed=%d' \
+        "$(ts)" "$name" "$updated" "$unchanged" "$created" "${#diverged[@]}" "$failed")"
     if   [ "$failed" -gt 0 ];         then paint 1 31 "$summary"
     elif [ "${#diverged[@]}" -gt 0 ]; then note "$summary"
     else                                   ok "$summary"
     fi
-    local d; for d in ${diverged[@]+"${diverged[@]}"}; do note "  DIVERGED — left for review: $d"; done
-    return "$failed"
+    local d
+    for d in ${diverged[@]+"${diverged[@]}"}; do note "  DIVERGED — left for review, not fetched: $d"; done
+    # A count alone leaves a failed repo unnamed.
+    for d in ${failures[@]+"${failures[@]}"}; do paint 1 31 "  FAILED — $d"; done
+    # Divergence is a state to resolve, not a run failure; only hard errors fail.
+    [ "$failed" -eq 0 ]
 }
 
 cmd_mirror() {
@@ -413,13 +713,15 @@ cmd_mirror() {
 }
 
 # ---------------------------------------------------------------- serve
-# The one command a replication key may run: fetch, push, or list, confined to
-# a bare repo directly under BARE_DIR. Goes in authorized_keys as command="...".
+# The one command a replication key may run: fetch, push, list, or refs,
+# confined to a bare repo directly under BARE_DIR. Goes in authorized_keys as
+# command="...".
 cmd_serve() {
     load_config
     set -f
     local c="${SSH_ORIGINAL_COMMAND:-}"
     if [ "$c" = "tandem list" ]; then exec "$(resolve_self)" list; fi
+    if [ "$c" = "tandem refs" ]; then exec "$(resolve_self)" refs; fi
     if [[ "$c" =~ ^(git-upload-pack|git-receive-pack)\ \'([^\']+)\'$ ]]; then
         local verb="${BASH_REMATCH[1]}" path="${BASH_REMATCH[2]}"
         case "$path" in
@@ -499,7 +801,15 @@ systemd_dir() { printf '%s/systemd/user' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 
 cmd_install() {
     load_config
-    local interval="${1:-300}"
+    local interval="${1:-300}" i
+    # A peer that is this machine can never be mirrored from; a timer naming
+    # it would connect to itself every run, and nothing in its log would say so.
+    for i in ${PEER_NAMES[@]+"${!PEER_NAMES[@]}"}; do
+        is_this_machine "${PEER_HOSTS[$i]}" &&
+            die 2 "Not installed: peer ${PEER_NAMES[$i]} = ${PEER_HOSTS[$i]} is this machine ($(local_name))." \
+                  "A peer line names another machine; remove that one from $CONFIG." \
+                  "This machine's work reaches the others through the timers installed there."
+    done
     case "$(uname -s)" in
         Darwin) install_launchd "$interval" ;;
         Linux)  install_systemd "$interval" ;;
@@ -539,7 +849,7 @@ install_launchd() {
 PLIST
     launchctl unload "$plist" 2>/dev/null || true
     launchctl load "$plist"
-    ok "Installed local.tandem.mirror (launchd): every ${interval}s, \`tandem mirror\`. Log: $log"
+    ok "Installed local.tandem.mirror (launchd): every ${interval}s (on battery, at most every ${BATTERY_INTERVAL}s), \`tandem mirror\`. Log: $log"
 }
 
 uninstall_launchd() {
@@ -603,13 +913,17 @@ cmd_init() {
 # bare_dir      where bare repositories live on this machine.
 # projects_dir  where working repositories live (for tracking-ref refresh).
 # timeout       seconds to wait on an unreachable peer.
+# battery_interval  on battery (macOS only), seconds a mirror run waits after
+#               the last one began; 0 runs at the timer's interval regardless.
 # peer <name> = <ssh-host>   one line per other machine. <name> becomes that
 #               machine's remote name; <ssh-host> is how to reach it over SSH.
+#               Never this machine itself.
 
 machine = this-machine
 bare_dir = ~/GitRemotes
 projects_dir = ~/Projects
 timeout = 5
+battery_interval = 1800
 
 # peer laptop = laptop.local
 # peer desktop = desktop.example.com
@@ -626,6 +940,7 @@ case "${1:-}" in
     adopt)     cmd_adopt ;;
     status)    shift; cmd_status "${1:-}" ;;
     list)      load_config; cmd_list ;;
+    refs)      load_config; cmd_refs ;;
     serve)     cmd_serve ;;
     install)   shift; cmd_install "${1:-}" ;;
     uninstall) cmd_uninstall ;;

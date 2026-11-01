@@ -11,9 +11,9 @@ only**, so a history that has diverged is reported for you to resolve rather tha
 force-overwritten, and a machine that is asleep or off the network is treated as
 "away," never as an error.
 
-It is a small, dependency-free Bash script that runs on macOS and Linux. The
-background timer uses `launchd` on macOS and a `systemd --user` timer on Linux;
-the sync/mirror commands themselves are plain POSIX-ish shell and Git.
+It is a small, dependency-free Bash script, developed and tested on macOS.
+Linux is supported with caution and Windows not at all; see
+[Platforms](#platforms).
 
 ## Why this exists
 
@@ -50,9 +50,11 @@ tool (that is Kubernetes'
   filesystem is **required**, the ones reached over the network are **best
   effort**. So the same command is local-first on every machine.
 - **`tandem mirror`** replicates the *bare* repositories from each peer into this
-  machine's, fast-forward only. It runs on a `launchd` timer and on demand. This
-  is the only step that crosses the network for bare history, so replication does
-  not need every machine awake at once.
+  machine's, fast-forward only. It runs on a timer and on demand. This is the
+  only step that crosses the network for bare history, so replication does not
+  need every machine awake at once. A run holds one SSH connection per peer,
+  asks the peer which refs it has (`tandem refs`), and fetches only the
+  repositories that moved there, so a quiet run fetches nothing.
 
 Each machine has a short name (e.g. `desktop`, `laptop`). Every repo gets one
 remote per machine, named after it; the one pointing at *this* machine's bare
@@ -77,6 +79,11 @@ peer laptop = laptop.local
 ```
 
 On the laptop, the same file with `machine = laptop` and `peer desktop = ...`.
+A peer line must name another machine, never the one the file is on; `install`
+refuses one that does, and `mirror` skips it and says so. On a laptop,
+`battery_interval = 1800` (the default, in seconds) is how long a mirror run
+waits after the previous one while on battery; `0` disables the wait. Every key
+is described in [config.example](config.example).
 
 ## Use
 
@@ -94,7 +101,8 @@ Keep the bares flowing between machines automatically:
 
 ```sh
 tandem install    # background timer: `tandem mirror` every 5 minutes
-                  # (launchd on macOS, systemd --user timer on Linux)
+                  # (launchd on macOS, systemd --user timer on Linux);
+                  # on battery (macOS), at most every 30 minutes
 tandem mirror     # or run it by hand
 tandem status --bares   # what each local mirror currently holds
 ```
@@ -111,8 +119,11 @@ restricted to replication only:
 restrict,command="/home/you/.local/bin/tandem serve" ssh-ed25519 AAAA... peer-key
 ```
 
-`tandem serve` permits only `git-upload-pack`, `git-receive-pack`, and
-`tandem list`, each confined to a bare repo directly under `bare_dir`.
+`tandem serve` permits only `git-upload-pack`, `git-receive-pack`,
+`tandem list` and `tandem refs`, each confined to a bare repo directly under
+`bare_dir`. A peer that cannot answer `tandem refs` — an older tandem, a key
+restricted by an older `serve`, no `tandem` on its PATH — is still mirrored:
+every repository is fetched, as before 0.4.0, and the log says so.
 
 ## Commands
 
@@ -122,8 +133,9 @@ restrict,command="/home/you/.local/bin/tandem serve" ssh-ed25519 AAAA... peer-ke
 | `tandem mirror` | Pull every peer's bare repos into this machine's, ff-only |
 | `tandem adopt` | (Re)point this repo's remotes at the machine it sits on |
 | `tandem status [--all\|--bares]` | This repo's remotes / every synced repo / local bares |
+| `tandem list` / `tandem refs` | This machine's bare names / their heads and tags, for a peer's `mirror` |
 | `tandem serve` | SSH forced command for an `authorized_keys` replication key |
-| `tandem install` / `uninstall` | Manage the `launchd` mirror timer |
+| `tandem install` / `uninstall` | Manage the mirror timer (`launchd` or `systemd --user`) |
 | `tandem init` | Write a starter config |
 
 Environment: `TANDEM_CONFIG` (config path), `TANDEM_NO_ADOPT` (skip the
@@ -136,16 +148,37 @@ auto-adopt check). Per-remote `git config remote.<name>.sshCommand` is honored.
   (`DIVERGED — left for review`), never forced.
 - **`tandem sync`** refuses to fast-forward a dirty tree and refuses diverged
   histories; it never force-pushes.
-- **`tandem serve`** only ever runs the three replication verbs, only under
+- **`tandem serve`** only ever runs the four replication verbs, only under
   `bare_dir`, and rejects path traversal.
+- **A skip needs positive evidence.** `mirror` leaves a repository unfetched
+  only when the peer's own `refs` answer shows nothing moved; a repository the
+  peer did not read, a line it cannot parse, or a local read that failed is
+  fetched. A bare that is merely *ahead* of the peer is not fetched either,
+  since the peer takes that on its own run — it used to be reported as
+  `DIVERGED` every run until the peer caught up.
+
+## Platforms
+
+- **macOS** is where tandem is developed and tested. Every release is run
+  between two Macs, and the scenarios in `tests/mirror.sh` run under the
+  system Bash 3.2.
+- **Linux: use with caution.** The `systemd --user` timer (since 0.2.0) is
+  believed to work, but 0.4.0 has not been run on Linux. Two of its features
+  are macOS-shaped by construction: the battery wait reads `pmset`, so on
+  Linux a mirror run always goes ahead at the timer's interval; and the check
+  that a peer line names this machine reads `ifconfig` for its addresses, so
+  on a Linux without it only this machine's *names* are recognised, and a
+  peer given as its own IP address is tried every run, as before, and fails
+  harmlessly.
+- **Windows** is not supported and has never been tried. Under WSL, tandem is
+  a Linux program.
+- Anything else with Bash, Git and SSH should run `sync`, `mirror` and
+  `serve`; schedule `tandem mirror` from cron. Ports to other schedulers are
+  welcome — the OS-specific code is isolated to `install`/`uninstall`; see
+  [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Limitations
 
-- The background timer supports macOS (`launchd`) and Linux (`systemd --user`);
-  on anything else, schedule `tandem mirror` from cron. `sync`/`mirror`/`serve`
-  work on any Unix with Bash and Git. Ports to other schedulers are welcome —
-  the OS-specific code is isolated to `install`/`uninstall`; see
-  [CONTRIBUTING.md](CONTRIBUTING.md).
 - Assumes the same `bare_dir` path on every machine (override with
   `remote_bare_dir`).
 - New *repositories* are discovered from peers automatically; brand-new

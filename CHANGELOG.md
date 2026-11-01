@@ -4,6 +4,41 @@ All notable changes to tandem are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-11-01
+
+### Added
+
+- `tandem refs`: every local bare's heads and tags, one line each, which
+  `tandem serve` now permits alongside `list`. A peer's `mirror` compares it
+  with its own copies and fetches only the repositories that moved; a quiet
+  run fetches nothing (`unchanged=N` in the summary). A peer that cannot answer
+  — an older tandem, a key restricted by an older `serve` — has every
+  repository fetched as before, and the log says so.
+- `battery_interval` (config, default 1800 seconds): on battery, a mirror run
+  waits this long after the previous one began instead of running at the
+  timer's every tick. Stretched, not stopped — a laptop's bares are its travel
+  copy. Read from `pmset`, so macOS only; elsewhere the timer's interval is
+  the only one. `0` disables it.
+- `tests/mirror.sh`: the mirror scenarios as a shell suite, with every command
+  that touches the world faked and the peer served by the real `tandem serve`.
+
+### Changed
+
+- `mirror` holds one SSH connection per peer per run (`ControlMaster`), shared
+  by the probe, the listing, the refs and every fetch. A run over 24
+  repositories went from one handshake each to one in all.
+- `install` refuses a peer line that names the machine it is on, and `mirror`
+  skips one, saying which line to remove. A laptop ran a timer naming itself
+  every five minutes for two months with nothing in the log but
+  "unavailable".
+- A mirror that is merely ahead of its peer is no longer fetched, and so no
+  longer reported `DIVERGED` run after run until the peer caught up.
+- A repository that fails is named in the summary with git's first line; a
+  name from the peer that is not one path component (`../x.git`, `.x.git`)
+  is refused rather than made.
+- The README states the platforms plainly: macOS tested, Linux with caution,
+  Windows not supported.
+
 ## [0.3.1] — 2026-08-21
 
 ### Fixed
@@ -86,6 +121,7 @@ Initial release.
   `tandem mirror` (macOS).
 - Config-driven for any number of machines via `~/.config/tandem/config`.
 
+[0.4.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.4.0
 [0.3.1]: https://github.com/jackzh5841/tandem/releases/tag/v0.3.1
 [0.3.0]: https://github.com/jackzh5841/tandem/releases/tag/v0.3.0
 [0.2.2]: https://github.com/jackzh5841/tandem/releases/tag/v0.2.2

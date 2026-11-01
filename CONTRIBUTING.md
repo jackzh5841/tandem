@@ -7,16 +7,21 @@ silently discard history will not be merged, however convenient.
 
 ## Porting to other platforms — please do
 
-tandem is macOS-first only in one place: the background timer. **You are very
-welcome to branch and port it to other platforms** — a Linux/systemd version is
-the most obvious and wanted.
+tandem is developed and tested on macOS; Linux has a `systemd --user` timer
+since 0.2.0 but 0.4.0 has not been run there, and Windows has never been tried.
+**You are very welcome to branch and port it** — a Linux run of
+`tests/mirror.sh`, and the two Linux halves below, are the most wanted.
 
-The OS-specific seam is tiny and isolated:
+The OS-specific seams are small and isolated:
 
-- `cmd_install` / `cmd_uninstall` — write and load the periodic job. On macOS
-  this is a `launchd` plist calling `tandem mirror`. A Linux port adds a
-  `systemd --user` timer + service (or a cron entry) doing the same, selected by
-  detecting the platform.
+- `cmd_install` / `cmd_uninstall` — write and load the periodic job: a
+  `launchd` plist on macOS, a `systemd --user` timer and service on Linux,
+  selected by `uname -s`.
+- `on_battery()` reads `pmset`, which is macOS's. A Linux port reads
+  `/sys/class/power_supply/*/status`; without one, Linux always reads as mains
+  power, which is the safe direction (the run goes ahead).
+- `this_machine()` lists this machine's addresses with `ifconfig`. A Linux
+  port adds `ip -o addr`; without one, only this machine's names are known.
 - `mtime()` already handles both BSD (`stat -f`) and GNU (`stat -c`) `stat`.
 
 Everything else — `sync`, `mirror`, `adopt`, `serve`, `list`, `status` — is plain
@@ -40,8 +45,16 @@ Ways to contribute a port:
   filesystem must succeed; a remote over the network may be away. A run that
   reaches nothing fails (exit 4); it never reports a false success.
 - **`serve` stays confined.** It may only run `git-upload-pack`,
-  `git-receive-pack`, or `tandem list`, each against a bare repo directly under
-  `bare_dir`, and must reject path traversal.
+  `git-receive-pack`, `tandem list` or `tandem refs`, each against a bare repo
+  directly under `bare_dir`, and must reject path traversal.
+- **A skip needs positive evidence.** `mirror` may leave a repository
+  unfetched only when the peer's `refs` answer shows nothing moved; anything it
+  cannot tell — a repository the peer did not read, a line that is not a sha
+  and a well-formed head or tag, a local read that failed, a peer that did not
+  answer — is fetched, with the fast-forward-only globs. The peer's words are
+  checked before they become a revision or a refspec.
+- **Nothing the peer names leaves `bare_dir`.** A name with a slash or a
+  leading dot is refused, not made.
 - **`sync` never touches a dirty tree or a diverged history**, and never
   force-pushes.
 
@@ -55,18 +68,35 @@ Ways to contribute a port:
 
 ## Testing
 
-There is no framework; tests are shell scenarios run against sandbox `HOME`s and
-local bare repos. Before opening a PR, exercise at least:
+`tests/mirror.sh` holds the `mirror` scenarios: a peer that is this machine,
+one connection per run, the battery wait, fetching only what moved, the
+checks on what the peer says, working trees, `refs`, `serve`, and names that
+would escape `bare_dir`. Every command tandem asks about the world — `ssh`,
+`scutil`, `hostname`, `ifconfig`, `pmset`, `launchctl` — is a fake on `PATH`,
+`HOME` is a temporary directory, and the peer is a folder of real bares served
+by the real `tandem serve`; no network is touched and no timer is loaded.
+
+```sh
+bash tests/mirror.sh            # your everyday Bash
+/bin/bash tests/mirror.sh       # macOS's 3.2, which the script must still run under
+DEBUG=1 bash tests/mirror.sh    # a failure prints the run's output and its ssh calls
+```
+
+The exit status is the number of failed checks. `TANDEM_UNDER_TEST=<path>`
+runs the suite against another copy of the script: before trusting a new
+assertion, break the code it guards in a copy and watch it fail. The release
+of 0.4.0 did that with fifteen such copies.
+
+`sync`, `adopt` and `init` have no suite yet. Before opening a PR that touches
+them, exercise at least, in a sandbox `HOME` with local bare repos:
 
 - `tandem init`, `tandem adopt`, and `tandem sync` with one reachable local
   remote and one unreachable peer (expect "N of M remotes", exit 0).
-- The `serve` filter: it allows the three replication verbs under `bare_dir` and
-  rejects traversal, out-of-scope paths, and arbitrary commands.
 - The fast-forward guarantee: a mirror with a local-only commit must be left
   untouched when the peer has diverged.
 
-Run the script under `/bin/bash` (3.2) as well as your everyday Bash to catch
-version-specific issues.
+Say which platforms you ran on; a Linux run of the suite is itself a
+contribution.
 
 ## Submitting
 
